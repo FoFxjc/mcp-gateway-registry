@@ -778,3 +778,52 @@ Only decisions that cannot be inferred from repository evidence or the stated Pr
 2. **Personal identity mechanism: a single owner credential + agent bearer tokens, or a minimal self-hosted OIDC provider?** Both are implementable behind the §20.1 seam; the trade-off is standards-based login UX versus operational simplicity. A values call, not a technical one.
 3. **Semantic search in V1: ship text-only by default (lighter image, faster installs) and make vector search an opt-in extra — or is natural-language capability discovery core enough to Preve to pay the dependency cost from day one?** A product-priority decision; the code supports either.
 4. **Peer federation: near-term need or not?** If cross-registry federation (a second personal instance, a collaborator's fabric) is anticipated, keep the dormant peer-federation code; otherwise it becomes a Phase 7 removal candidate. Only the owner knows the roadmap.
+
+---
+
+## 27. Owner Acceptance Status
+
+**Verdict: ACCEPTED WITH NON-BLOCKING NOTES.**
+
+This audit is ready to become the frozen architecture baseline for implementation. The direction (selective retention with isolation), the seam-first strategy, the execution-gate phases, and the first-slice contract are internally consistent and grounded in traced code references. The notes below are non-blocking; they do not prevent Slice 1 from starting.
+
+### What is now frozen
+
+- **The migration direction:** selective retention with isolation. No rewrite; no blanket enterprise deletion.
+- **The customization hierarchy (§19):** configuration/profile → feature flag → stable seam → isolated personal implementation → replacement behind a seam → deletion only when justified → invasive core rewrite only as a last resort.
+- **The architectural seams (§20):** identity (`resolve_principal`), authorization/trust (`classify_trust`/`authorize`), and audit (`EventSink`). These are the contracts the enterprise and personal implementations both sit behind.
+- **The migration invariants (§22):** all 10 are frozen and bind every phase.
+- **The phase gates (§5):** each phase's allowed/forbidden change surface, entry/acceptance criteria, rollback condition, and required evidence are frozen.
+- **The first-slice contract (§17/§23):** the validated Personal V1 configuration/deployment profile, its acceptance criteria, its required evidence, and its explicit non-goals.
+
+### What is explicitly NOT frozen
+
+- **The default topology (Option A vs. Option B)** — §21 recommends B; the final call is owner decision §26.1. Slice 1 is topology-agnostic (it proves the profile through configuration), so this does not block Slice 1.
+- **The personal identity mechanism** (owner credential + agent tokens vs. minimal OIDC) — §26.2.
+- **Semantic search default** (text-only vs. opt-in vector) — §26.3.
+- **Peer federation's future** (keep dormant vs. Phase 7 removal) — §26.4.
+- **All Phase 2–7 details** — only the phase *gates* are frozen; the implementation within each gate is designed when that phase is reached.
+
+### What the next implementation PR (Slice 1) is allowed to do
+
+- Add a single new `docker-compose.preve.yml` (registry + MongoDB-CE + optional simplified auth path).
+- Add a composable config preset (e.g., `PREVE_PROFILE`) in `registry/core/config.py` that is purely additive and does not change any default when unset.
+- Add `docs/preve/` profile documentation and the smoke-test runbook.
+- Optionally add a frontend feature-flag to hide IAM/audit/federation nav (presentation only).
+- Prove the §17 acceptance criteria and produce the §17 evidence.
+
+### What the next implementation PR is forbidden to do
+
+- No auth rewrite. No RBAC/scopes deletion. No audit deletion.
+- No frontend redesign or page deletion.
+- No repository/storage replacement.
+- No broad dependency cleanup (no torch/scanner removal in this slice).
+- No deletion of Terraform/Helm/AWS/IdP assets (all deferred to Phase 7 / §25).
+- No edits to route handlers, the nginx `/validate` contract, or the repository interface signatures.
+- No unrelated refactors.
+
+### Non-blocking notes (do not prevent Slice 1)
+
+1. §18 retains a 5-item open-questions list for narrative flow; §26 is the authoritative, deduplicated owner-decision list. Two §18 items (datastore, gateway default) are already resolved by §21/§22 and appear in §18 only for context — an implementing agent should follow §26.
+2. Slice 1 can proceed before owner decision §26.1 (topology) is finalized, because the profile proves the personal topology through configuration regardless of whether auth is embedded (B) or a separate process (A). The auth-server container is simply included-or-not in the Compose profile.
+3. The two firm removals (`core/telemetry.py`, ML scanner dependencies) belong to Phase 2/3, not Slice 1; Slice 1 must not touch them.
