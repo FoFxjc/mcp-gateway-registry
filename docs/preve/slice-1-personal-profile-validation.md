@@ -160,16 +160,41 @@ PYTHONPATH=. .venv/bin/python -m pytest tests/unit/core/ \
 Every unit test under `tests/unit/core/` (the package containing the
 touched `config.py`) passes unchanged.
 
-A full `tests/unit/` run (~3000+ tests per CLAUDE.md) was also started with
-`-n 4` for additional assurance beyond the targeted runs above. It ran clean
-(no failures observed in the streamed output) through the point this report
-was finalized, but was not confirmed complete before this PR was opened —
-the targeted, complete runs above (`tests/unit/core/` in full, plus the
-exact deployment-mode/A2A-reverse-proxy test files) already give full
-coverage of every file this slice touches, so the full-suite run is
-additional assurance rather than required evidence. If it surfaces any
-failure after this report is written, it will be filed as a follow-up
-rather than silently dropped.
+The full `tests/unit/` suite was also run to completion for maximum
+assurance:
+
+```bash
+PYTHONPATH=. .venv/bin/python -m pytest tests/unit/ \
+  -q -p no:langsmith_plugin --no-cov -o addopts="" -n 4
+# 6221 passed, 29 skipped, 14 errors in 414.31s
+```
+
+The 14 "errors" were all `ModuleNotFoundError: No module named 'factory'`
+collection failures — a gap in this session's own hand-assembled virtual
+environment (the `[dependency-groups] dev` extras `factory-boy`,
+`hypothesis`, and `faker` were not yet installed in the Python 3.13 venv;
+see "Regression test results" above for why this session could not simply
+run `uv sync --group dev` under the project's declared Python 3.14).
+Installing those three packages and re-running exactly the 14 affected
+files resolved every one of them cleanly:
+
+```bash
+PYTHONPATH=. .venv/bin/python -m pytest \
+  tests/unit/api/test_agent_routes.py tests/unit/api/test_agent_routes_etag.py \
+  tests/unit/api/test_agent_routes_patch_batch.py tests/unit/api/test_pull_card_endpoint.py \
+  tests/unit/api/test_pull_card_helpers.py tests/unit/api/test_search_routes.py \
+  tests/unit/audit/test_mcp_logger.py tests/unit/audit/test_models_properties.py \
+  tests/unit/audit/test_routes.py tests/unit/services/test_agent_batch_item_processor.py \
+  tests/unit/services/test_agent_service.py tests/unit/test_skill_routes_security.py \
+  tests/unit/test_skill_scanner_service.py tests/unit/test_skill_security_schemas.py \
+  -q -p no:langsmith_plugin --no-cov -o addopts=""
+# 346 passed, 2 skipped in 56.03s
+```
+
+**Combined full-suite result: 6567 passed, 31 skipped, 0 failed, 0 errors.**
+This includes `tests/unit/api/test_agent_routes.py`, which directly
+exercises A2A agent registration through the same route this slice's
+invariants depend on.
 
 New test coverage added for this slice:
 
