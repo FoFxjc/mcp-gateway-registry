@@ -26,7 +26,7 @@
 - **Feature flags already shrink the runtime.** `REGISTRY_MODE` can restrict the service to `agents-only` or `mcp-servers-only` (`config.py:139-146`); rate limiting, federation, telemetry, and the A2A reverse proxy are all default-off.
 - **The datastore is not AWS-locked at runtime.** `STORAGE_BACKEND` accepts `mongodb-ce` (community MongoDB) alongside `documentdb` (`config.py:73-110`); the same motor client serves both, with DocumentDB retained only for SCRAM-SHA-1 auth selection (`registry/utils/mongodb_connection.py`).
 
-**How difficult the migration appears.** Moderate, and mostly *subtractive at the edges rather than surgical at the core*. The core fabric (registry + MongoDB + optional nginx) is already personal-scale: one process, one datastore, one optional proxy. The hard part is not removing code but *decoupling identity*: auth_server, the scopes engine, and the audit sink are woven through every route via `registry/auth/dependencies.py` and the nginx `/validate` hop. Replacing workforce IAM with an owner/trusted/external model touches auth, frontend guards, and ~89K lines of tests that assume scopes exist.
+**How difficult the migration appears.** Moderate, and mostly *subtractive at the edges rather than surgical at the core*. The core fabric (registry + MongoDB + optional nginx) is already personal-scale: one process, one datastore, one optional proxy. The hard part is not removing code but *decoupling identity*: auth_server, the scopes engine, and the audit sink are woven through every route via `registry/auth/dependencies.py` and the nginx `/validate` hop. Replacing workforce IAM with an owner/trusted/external model touches auth, frontend guards, and ~102K lines of unit tests (`tests/unit/`) that assume scopes exist.
 
 **Reduction, isolation, replacement, or selective retention?** **Selective retention with isolation.** The evidence does not support a wholesale rewrite (the entity spine, repository abstraction, and protocol metadata are exactly right) nor a naive delete-the-enterprise-stuff pass (auth and audit are load-bearing everywhere). The correct shape is: keep the registry core and its repository/protocol abstractions; isolate IdP-specific auth behind a simplified personal provider; disable (not delete) the dormant governance subsystems; and defer removal of the deeply-wired, cheap-when-off machinery.
 
@@ -40,7 +40,7 @@ Each subsystem lists: responsibility · runtime role · inbound deps · outbound
 
 - **Responsibility:** unified inventory, registration, discovery, search, health, access model, audit, federation, egress-auth facade, virtual MCP aggregation for servers/agents/skills/custom entities.
 - **Runtime role:** single FastAPI process; lifespan in `registry/main.py:449+` seeds scopes, loads server/agent state, initializes search indexes, starts 5 background schedulers (peer sync, ARD ingestion, ANS sync, debounced nginx reload via `core/nginx_service.py`, telemetry heartbeat).
-- **Routers (29 registered):** `registry/api/` — `server_routes.py` (6,574 lines), `agent_routes.py` (2,894), `skill_routes.py`, `custom_entity_routes.py`/`custom_type_routes.py`, `search_routes.py`, `virtual_server_routes.py`, `federation_routes.py`/`peer_management_routes.py`, `egress_auth_routes.py`/`egress_oauth_facade_routes.py`, `rate_limit_routes.py`, `iam_user_groups_routes.py`, `m2m_management_routes.py`, `wellknown_routes.py`, `health` and `internal_routes.py`, plus auth/OAuth routes in `registry/auth/routes.py`.
+- **Routers (34 `include_router` registrations):** `registry/api/` — `server_routes.py` (6,574 lines), `agent_routes.py` (2,894), `skill_routes.py`, `custom_entity_routes.py`/`custom_type_routes.py`, `search_routes.py`, `virtual_server_routes.py`, `federation_routes.py`/`peer_management_routes.py`, `egress_auth_routes.py`/`egress_oauth_facade_routes.py`, `rate_limit_routes.py`, `iam_user_groups_routes.py`, `m2m_management_routes.py`, `wellknown_routes.py`, `health` and `internal_routes.py`, plus auth/OAuth routes in `registry/auth/routes.py`.
 - **Inbound:** nginx (data-plane `/validate`-gated calls), browser (session cookie), agents/MCP clients (Bearer JWT), peer registries (federation), auth-server (`X-Internal-Token-Registry`).
 - **Outbound:** auth-server `/api/internal/tokens/generate`; MongoDB/DocumentDB (motor); nginx config regen + reload; IdP JWKS endpoints (JWT verification); embeddings provider (LiteLLM/external HTTP); federation peers (httpx) and AWS AgentCore (boto3); webhooks; metrics-service.
 - **Persistence:** `registry/repositories/` — abstract bases in `interfaces.py`, DocumentDB/MongoDB impls in `documentdb/`, singleton factories in `factory.py`; 15+ collections; **no FAISS** — hybrid text+vector cosine search in `documentdb/search_repository.py` with sentence-transformers lazy-loaded.
@@ -145,18 +145,22 @@ These two categories must not be conflated: the first is deployment/operational 
 
 | Candidate | Real dependency trace | Verdict |
 |---|---|---|
-| **Keycloak** | Realm JSON, setup scripts, `providers/keycloak.py`, group mappings parsed from SCOPES_CONFIG, OBO in `egress_obo.py` | Remove; keep generic OIDC seam |
-| **Entra/Okta/Auth0/Cognito/PingFederate** | One `providers/*.py` each + `oauth2_providers.yml` entries + `setup/idp/*` | Remove; provider interface is the seam to keep |
-| **Group→scope mapping** | `auth_server/group_filter.py`, `mongodb_groups_enrichment.py`, scope repo group tests | Simplify to 3 fixed trust tiers |
-| **Enterprise RBAC (scopes)** | `access_resolver.py`, `SCOPES_CONFIG`, 14+ repo tests | Simplify; keep the resolver, shrink the config |
-| **Compliance audit** | `registry/audit/` durable fail-closed MongoDB sink, HMAC | Reduce to operational event log |
+Verdicts are consistent with the §25 re-evaluation: deployment-only and dormant-cheap items are left dormant, not deleted (see §25 for the reasoning).
+
+| Candidate | Real dependency trace | Verdict |
+|---|---|---|
+| **Keycloak** | Realm JSON, setup scripts, `providers/keycloak.py`, group mappings parsed from SCOPES_CONFIG, OBO in `egress_obo.py` | Simplify behind seam — keep `providers/base.py` + one personal provider; provisioning dirs left dormant |
+| **Entra/Okta/Auth0/Cognito/PingFederate** | One `providers/*.py` each + `oauth2_providers.yml` entries + `setup/idp/*` | Simplify behind seam — provider interface is the seam; delete extra providers only in Phase 7 if §25 confirms low merge cost |
+| **Group→scope mapping** | `auth_server/group_filter.py`, `mongodb_groups_enrichment.py`, scope repo group tests | Simplify behind §20.2 seam — 3 trust tiers as the personal implementation; enterprise mapping retained |
+| **Enterprise RBAC (scopes)** | `access_resolver.py`, `SCOPES_CONFIG`, 14+ repo tests | Simplify behind §20.2 seam — keep the resolver; add a 3-tier personal classification, not a rewrite |
+| **Compliance audit** | `registry/audit/` durable fail-closed MongoDB sink, HMAC | Reduce behind §20.3 seam — add the operational-event sink; compliance sink retained and selectable |
 | **Rate-limit governance / quarantine admin** | `rate_limiting/`, admin UI `IAMRateLimits.tsx`; default off | Leave disabled; defer |
 | **Per-user SaaS credential brokerage** | `egress_auth/`, `credentials-provider/`, secret-store backends | Leave disabled; defer |
-| **EKS/ECS/Helm/Terraform/CDK/CodeBuild** | `charts/`, `terraform/`, `infra/`, `buildspec.yml`, 7 CI workflows | Remove from personal fork |
-| **AWS workshop/setup flows** | `setup/`, README workshop links, macos/remote-desktop guides | Remove |
-| **Multi-deployment config parity** | `ALLOWED_STORAGE_BACKENDS` "keep in sync with Terraform" comment (`config.py:70-72`), infra-sync skill | Remove with the second IaC surface |
-| **LLM security scanning** | `cisco-ai-*-scanner` deps, `services/security_scanner*` | Remove |
-| **Telemetry** | `core/telemetry.py` heartbeat to external endpoint | Remove |
+| **EKS/ECS/Helm/Terraform/CDK/CodeBuild** | `charts/`, `terraform/`, `infra/`, `buildspec.yml`, 7 CI workflows | **Leave dormant (defer)** — excluded from the personal profile/CI but retained in-tree (§25) |
+| **AWS workshop/setup flows** | `setup/`, README workshop links, macos/remote-desktop guides | **Leave dormant (defer)** — docs/scripts cost nothing; remove only in Phase 7 |
+| **Multi-deployment config parity** | `ALLOWED_STORAGE_BACKENDS` "keep in sync with Terraform" comment (`config.py:70-72`), infra-sync skill | Defer — the constraint only bites if a second IaC surface is edited; harmless while Terraform is dormant |
+| **LLM security scanning** | `cisco-ai-*-scanner` deps, `services/security_scanner*` | Remove *dependencies* (Phase 2) — heavy third-party packages, not upstream-mergeable code; leave the (dormant) scan service code |
+| **Telemetry** | `core/telemetry.py` heartbeat to external endpoint | Remove — phones home; small, self-contained, low upstream-coupling |
 
 ### 4.2 Portability / interoperability abstractions worth preserving
 
@@ -287,26 +291,28 @@ Design rule: *boring infrastructure, single owner, Docker Compose on one Mac/VPS
 
 ## 7. Coupling Assessment
 
+Verdicts here are consistent with the §25 re-evaluation: deployment-only and dormant-cheap couplings are **left dormant**, not deleted, to preserve upstream mergeability. "Remove dependencies" applies only to heavy third-party packages, not upstream-mergeable code.
+
 | Coupling | Verdict | Why |
 |---|---|---|
-| **AWS (boto3)** | **Remove** | Only used by AgentCore federation + secrets backend; both deferred/removed |
-| **EKS/ECS** | **Remove** | Deploy target only; no runtime dep |
-| **Helm** | **Remove** | No K8s requirement for personal |
-| **Terraform / CDK (`infra/`)** | **Remove** | AWS IaC; owner uses Compose |
-| **Enterprise IdPs** | **Remove (keep one OIDC seam)** | Workforce IAM out of scope |
+| **AWS (boto3)** | **Remove dependency only** | boto3 is used only by AgentCore federation + the AWS secrets backend; both are dormant (Phase 3). Drop the *dependency* in Phase 2 if unused; do not delete the (dormant) AWS-feature code |
+| **EKS/ECS** | **Leave dormant (defer)** | Deploy target only; no runtime dep; deleting manifests diverges from upstream for zero runtime benefit (§25) |
+| **Helm** | **Leave dormant (defer)** | No K8s requirement, but dormant charts cost nothing and stay mergeable (§25) |
+| **Terraform / CDK (`infra/`)** | **Leave dormant (defer)** | AWS IaC; excluded from the personal profile but retained in-tree to keep upstream merges clean (§25) |
+| **Enterprise IdPs** | **Simplify behind seam (defer deletion)** | Workforce IAM out of scope; keep `providers/base.py` + one personal provider, select it by config; delete the other providers only in Phase 7 if §25 confirms low merge cost |
 | **OAuth/OIDC provider impls** | **Simplify to one** | Keep `providers/base.py` seam; ship a single personal provider |
-| **Scopes/RBAC** | **Simplify** | Keep resolver; collapse config to 3 trust tiers |
+| **Scopes/RBAC** | **Simplify behind seam** | Keep resolver; add the §20.2 trust seam and a 3-tier personal implementation; do not rewrite the enterprise engine |
 | **MongoDB** | **Retain** | Portable (community edition), abstraction already present; not worth swapping for V1 |
 | **nginx** | **Retain as optional** | Generic proxy; valuable front door, p2p-safe by default |
-| **React admin UI** | **Simplify** | Keep entity/discovery pages; hide IAM/audit/federation |
-| **Semantic embeddings** | **Isolate behind flag/adapter** | Heavy deps; make vector search opt-in, text default |
-| **Federation** | **Leave disabled (defer)** | Peer federation may matter later; vendor clients removable |
+| **React admin UI** | **Simplify** | Keep entity/discovery pages; hide IAM/audit/federation behind a feature flag |
+| **Semantic embeddings** | **Isolate behind flag/adapter** | Heavy deps; make vector search opt-in, text default (Phase 2) |
+| **Federation** | **Leave disabled (defer)** | Peer federation may matter later; vendor clients removable only in Phase 7 |
 | **Egress credential brokerage** | **Leave disabled (defer)** | Enterprise per-user vault; owner holds own tokens |
 | **Admission gates / webhooks** | **Leave disabled** | Governance workflow |
-| **Observability (OTel/metrics-service)** | **Simplify** | Keep OTel hooks; drop metrics-service/Grafana from V1 compose |
+| **Observability (OTel/metrics-service)** | **Simplify** | Keep OTel hooks; metrics-service/Grafana optional (not in the default compose profile) |
 | **Rate limiting** | **Leave disabled** | nginx edge limits suffice for one owner |
 | **Quarantine** | **Leave disabled** | Governance feature |
-| **Enterprise audit** | **Replace with event log** | See §9 |
+| **Enterprise audit** | **Reduce behind seam (defer deletion)** | Add the §20.3 operational-event implementation; retain the compliance implementation, selectable by config (§9) |
 
 ---
 
