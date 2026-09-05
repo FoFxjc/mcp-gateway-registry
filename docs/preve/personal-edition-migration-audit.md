@@ -125,13 +125,15 @@ Classification is based on dependency tracing, not names. "Dormant" means defaul
 | Federation (peer + AgentCore/Anthropic/ASOR) | **DEFER** | Peer federation may matter later; AgentCore/Anthropic/ASOR are enterprise/vendor | Nothing when off | No |
 | Egress credential brokerage (`egress_auth/`, `credentials-provider/`) | **DEFER (leave disabled)** | Per-user SaaS token vault is enterprise; a single owner can hold their own tokens | 3rd-party OAuth MCP servers | No |
 | LLM security scanning (`cisco-ai-*-scanner`) | **REMOVE** | Heavy deps (torch, langchain, strands) for an enterprise compliance feature | Scan-on-register only | No |
-| Keycloak/Entra/Okta/Auth0/Cognito/PingFederate providers | **REMOVE all but one** | Workforce IAM; keep one generic OIDC or a single-user provider | Multi-IdP login | No |
-| Terraform `aws-ecs/`, CDK `infra/`, `buildspec.yml` | **REMOVE (from personal fork)** | AWS-shaped; owner targets Compose/Mac/VPS | AWS deploys | No |
-| Helm `charts/` | **REMOVE (from personal fork)** | No Kubernetes requirement | K8s deploys | No |
+| Keycloak/Entra/Okta/Auth0/Cognito/PingFederate providers | **SIMPLIFY (→ one personal provider; seam first)** | Workforce IAM; keep `providers/base.py` + one personal provider; delete the rest only in Phase 7 if §25 confirms low merge cost | Multi-IdP login | No |
+| Terraform `aws-ecs/`, CDK `infra/`, `buildspec.yml` | **DEFER (keep dormant in fork)** | AWS-shaped, but deployment-only and zero-runtime; deletion permanently diverges from upstream for no runtime benefit (§25) | AWS deploys | No |
+| Helm `charts/` | **DEFER (keep dormant in fork)** | No Kubernetes requirement, but dormant K8s manifests cost nothing at runtime and are upstream-mergeable (§25) | K8s deploys | No |
 | `metrics-service/` + Grafana/Prometheus stack | **SIMPLIFY (leave optional/off)** | Nice-to-have; SQLite metrics are cheap but not needed V1 | Dashboards | No |
 | Registration webhooks/admission gates | **DEFER (leave disabled)** | Governance workflow | Nothing when off | No |
-| `agents/`, `servers/` samples | **REMOVE (or keep 1 as example)** | Demo content | Nothing | No |
-| Telemetry heartbeat (`core/telemetry.py`) | **REMOVE** | Phones home to an external endpoint; inappropriate for personal | Nothing (already opt-out) | No |
+| `agents/`, `servers/` samples | **DEFER (keep as reference examples)** | Demo content; harmless, useful as A2A/MCP references | Nothing | No |
+| Telemetry heartbeat (`core/telemetry.py`) | **REMOVE** | Phones home to an external endpoint; inappropriate for personal; small, self-contained, low upstream-coupling so removal is safe | Nothing (already opt-out) | No |
+
+> **REMOVE→DEFER note (revised, §25):** only `core/telemetry.py` and the heavy ML scanner *dependencies* remain firm REMOVEs — both are low-upstream-coupling and provide no personal value. Deployment-only assets (Terraform/CDK/Helm) and dormant governance subsystems moved from REMOVE to DEFER because retaining dormant upstream code is cheaper than permanently diverging.
 
 ---
 
@@ -175,42 +177,81 @@ These two categories must not be conflated: the first is deployment/operational 
 
 ## 5. Dependency-Safe Migration Order
 
-The correct order is derived from the dependency graph, not from "clean up deployment first." Auth and audit are load-bearing (they sit in every request path), so they are migrated *last among core changes*, behind a stable seam. Deployment/IaC removal is safe early precisely because nothing in the runtime imports it. The ordering minimizes irreversible steps: everything before Phase 4 is reversible.
+The correct order is derived from the dependency graph, not from "clean up deployment first." Auth and audit are load-bearing (they sit in every request path — 217 route injection points consume `Depends(nginx_proxied_auth)`/`Depends(enhanced_auth)` from `registry/auth/dependencies.py`), so they are migrated *last among core changes*, behind a stable seam. Deployment/IaC removal is safe early precisely because nothing in the runtime imports it. The ordering minimizes irreversible steps: everything before Phase 4 is reversible.
+
+Each phase below is an **execution gate** — independently reviewable, with an explicit allowed/forbidden change surface, entry criteria, acceptance criteria, a rollback condition, and the evidence required to move forward. No phase bundles unrelated changes; if a phase cannot meet its acceptance criteria, the migration stops at that gate rather than forcing the next.
 
 ### Phase 0 — Baseline & characterization (reversible)
 - **Objective:** freeze current behavior so later phases are verifiable.
-- **Affected:** none (add a characterization test run; capture `DEPLOYMENT_MODE=registry-only` + `RATE_LIMITING_ENABLED=false` + `A2A_REVERSE_PROXY_ENABLED=false` as the personal baseline config).
-- **Dependencies first:** none. **Blast radius:** none. **Validation:** full `pytest tests/unit` green on MongoDB-CE. **Rollback:** n/a. **Non-goals:** no code change. **Untouched:** all runtime code.
+- **Allowed change surface:** test/config capture only — record the personal baseline (`DEPLOYMENT_MODE=registry-only`, `RATE_LIMITING_ENABLED=false`, `A2A_REVERSE_PROXY_ENABLED=false`, `AWS_REGISTRY_FEDERATION_ENABLED=false`).
+- **Forbidden change surface:** any runtime code, any dependency, any manifest.
+- **Entry criteria:** clean checkout of `main`; MongoDB-CE available for tests.
+- **Acceptance criteria:** full `pytest tests/unit` green on MongoDB-CE; baseline config committed as a documented profile.
+- **Rollback condition:** n/a (no mutation).
+- **Evidence required:** CI/unit run link; the captured baseline profile file.
 
-### Phase 1 — Shed pure-deployment weight (reversible, no runtime deps)
-- **Objective:** remove AWS/K8s surfaces nothing in `registry/` or `auth_server/` imports.
-- **Affected:** `terraform/`, `infra/`, `charts/`, `buildspec.yml`, `setup/`, AWS-coupled workflows, workshop docs.
-- **Dependencies first:** confirm no runtime import (verified: runtime only *names* Terraform in the `config.py:70` comment). **Blast radius:** deploy targets only. **Validation:** `docker-compose.yml` still builds; unit tests green. **Rollback:** `git revert`. **Non-goals:** do not touch docker-compose or the root Dockerfile. **Untouched:** `registry/`, `auth_server/`, `frontend/`, `docker/`.
+### Phase 1 — Personal deployment profile (reversible; supersedes "delete AWS first")
+- **Objective:** prove a personal Compose topology runs *alongside* — not instead of — the enterprise one. **Revised:** do NOT delete `terraform/`/`infra/`/`charts/` yet; add a minimal profile (see §17/§23).
+- **Allowed change surface:** a new `docker-compose.preve.yml`, a `docs/preve/` profile doc, an optional frontend nav feature-flag.
+- **Forbidden change surface:** `registry/`, `auth_server/`, `docker/` nginx templates, existing `docker-compose.yml`, Terraform/Helm/CDK, CI workflows.
+- **Entry criteria:** Phase 0 green.
+- **Acceptance criteria:** `docker compose -f docker-compose.preve.yml up` boots registry + MongoDB-CE + simplified-auth path; MCP + A2A register/discover smoke tests pass; no AWS env required.
+- **Rollback condition:** delete the new profile/compose file; defaults untouched.
+- **Evidence required:** boot log excerpt, smoke-test output, `config.py` effective-settings dump showing governance flags off.
 
-### Phase 2 — Remove heavy ML/security-scanning dependencies (low risk)
-- **Objective:** drop `cisco-ai-*-scanner`, and gate the torch/sentence-transformers/scikit-learn stack behind an optional search extra.
-- **Affected:** `pyproject.toml`, `services/security_scanner*`, registration-time scan hook, embeddings lazy-load path.
-- **Dependencies first:** make semantic search degradable to text-only (Phase 2b) *before* removing torch, or keep torch until search is optional. **Blast radius:** scan-on-register + vector search. **Validation:** unit tests with mocked embeddings (`tests/conftest.py` already auto-mocks); image size reduction. **Rollback:** `git revert` + `uv sync`. **Non-goals:** do not remove the search *abstraction*. **Untouched:** entity spine, auth.
+### Phase 2 — Make semantic search optional (low risk, dependency-lean)
+- **Objective:** gate torch/sentence-transformers/scikit-learn behind an opt-in extra so the default personal image is light; keep the search *abstraction* intact.
+- **Allowed change surface:** `pyproject.toml` (extras), the embeddings lazy-load path, a text-only search fallback in `semantic_search_service.py`.
+- **Forbidden change surface:** the search route contract (`api/search_routes.py`), the `ServerRepositoryBase`/`AgentRepositoryBase` search method signatures, entity schemas.
+- **Entry criteria:** Phase 1 green.
+- **Acceptance criteria:** text-only search returns correct results with no ML deps installed; vector search still works when the extra is installed; image size measurably smaller.
+- **Rollback condition:** `git revert` + `uv sync`.
+- **Evidence required:** unit tests with mocked embeddings (`tests/conftest.py` auto-mocks) green in both modes; image-size before/after.
 
 ### Phase 3 — Disable-and-dormant governance subsystems (reversible via flags)
-- **Objective:** prove the system runs personal-scale with enterprise subsystems off, before deleting anything.
-- **Affected:** config only — rate limiting, quarantine, federation, egress brokerage, webhooks, telemetry all default/off; delete only `core/telemetry.py` (phones home).
-- **Dependencies first:** none (all default-off). **Blast radius:** none at runtime. **Validation:** boot in registry-only mode; confirm no scheduler chatter. **Rollback:** re-enable flags. **Non-goals:** do not delete the dormant code yet. **Untouched:** `rate_limiting/`, `egress_auth/`, federation services (left dormant).
+- **Objective:** prove personal-scale operation with governance off; remove only the telemetry phone-home.
+- **Allowed change surface:** config flags (rate limiting, quarantine, federation, egress brokerage, webhooks off); deletion of `core/telemetry.py` heartbeat only.
+- **Forbidden change surface:** `rate_limiting/`, `egress_auth/`, `credentials-provider/`, federation services — left dormant, not deleted.
+- **Entry criteria:** Phases 1–2 green.
+- **Acceptance criteria:** boot in registry-only mode with no scheduler chatter from federation/rate-limit; telemetry makes no external call.
+- **Rollback condition:** re-enable flags; restore `core/telemetry.py` by revert.
+- **Evidence required:** startup log showing no peer-sync/ARD/ANS/telemetry scheduler activity; a network-egress check confirming no phone-home.
 
-### Phase 4 — Simplify identity behind the provider seam (highest coupling, do late)
-- **Objective:** replace workforce IAM with the owner/trusted/external model (§8) at the `auth/dependencies.py` + `providers/base.py` seam.
-- **Affected:** `auth_server/providers/` (keep one), `auth/access_resolver.py` (3 tiers), `auth_server/group_filter.py`, frontend auth guards, scope config.
-- **Dependencies first:** Phases 0–3 (stable core, no enterprise deploy noise). **Blast radius:** every authenticated route — this is why it is not first. **Validation:** full auth unit suite + a new trust-tier suite; manual login/discovery/call flow. **Rollback:** seam means old providers can be restored. **Non-goals:** do not redesign the session/JWT mechanics; do not touch the data plane. **Untouched:** nginx `/validate` contract, repository layer.
+### Phase 4 — Introduce the identity/trust/audit seams (no behavior change yet)
+- **Objective:** land the stable abstraction boundaries of §21 as *interfaces only*, with the enterprise implementations moved behind them unchanged. This phase adds seams; it does not simplify anything.
+- **Allowed change surface:** `registry/auth/dependencies.py` (introduce principal-resolution contract), `registry/auth/access_resolver.py` (trust-classification seam), `registry/audit/service.py` (event-sink seam). Existing enterprise classes become the default implementations.
+- **Forbidden change surface:** any route handler, the nginx `/validate` contract, scope *config* contents, frontend.
+- **Entry criteria:** Phases 1–3 green; §21 contracts reviewed.
+- **Acceptance criteria:** all 217 route injection points still resolve through the seam with identical behavior; full auth unit suite green with zero route edits.
+- **Rollback condition:** `git revert` (seams are additive).
+- **Evidence required:** auth + audit unit suites green; a diff proving no route handler changed.
 
-### Phase 5 — Reduce audit to operational events (after identity settles)
-- **Objective:** swap compliance audit for the lightweight event log (§9).
-- **Affected:** `registry/audit/` (models, middleware), audit UI pages.
-- **Dependencies first:** Phase 4 (event actor comes from the new identity model). **Blast radius:** observability only. **Validation:** events emitted for discover/invoke/register; no fail-closed startup requirement. **Rollback:** keep audit behind a flag initially. **Non-goals:** no compliance retention/export. **Untouched:** rate limiting, federation.
+### Phase 5 — Personal trust implementation behind the seam (highest coupling, do late)
+- **Objective:** add the owner/trusted-agent/external implementation of the §21 trust seam, selectable by config, leaving the enterprise implementation intact.
+- **Allowed change surface:** a new personal trust-classification module, a 3-tier scope preset, `auth_server/` reduced to one provider behind `providers/base.py`, frontend auth guards.
+- **Forbidden change surface:** the seam contracts themselves, the repository layer, the nginx `/validate` contract, deletion of the enterprise scope engine.
+- **Entry criteria:** Phase 4 seams landed and green.
+- **Acceptance criteria:** personal mode answers who-is-calling / which-target / trusted-yes-no without any enterprise IdP; enterprise mode still passes its own suite unchanged.
+- **Rollback condition:** select the enterprise implementation by config; the seam makes this a flip.
+- **Evidence required:** new trust-tier unit suite green; enterprise auth suite green; manual login/discovery/invoke flow in both modes.
 
-### Phase 6 — Prune dormant enterprise code (optional, last, irreversible)
-- **Objective:** physically remove subsystems proven dormant in Phase 3, only if desired for repo hygiene.
-- **Affected:** `rate_limiting/`, `egress_auth/`, `credentials-provider/`, federation vendor clients, extra IdP providers, audit UI.
-- **Dependencies first:** Phases 3–5; a full personal-edition soak. **Blast radius:** large diff, low runtime risk (code was off). **Validation:** full suite. **Rollback:** hard — this is why it is last and optional. **Non-goals:** removing the repository or protocol abstractions. **Untouched:** entity spine, storage seam, A2A/MCP surfaces.
+### Phase 6 — Reduce audit to operational events (after identity settles)
+- **Objective:** add the lightweight operational-event implementation of the §21 audit seam, keeping the compliance implementation available.
+- **Allowed change surface:** a slim event record + sink behind the audit seam, an optional single chronological event view.
+- **Forbidden change surface:** the compliance audit models/middleware (kept for enterprise mode), the audit seam contract.
+- **Entry criteria:** Phase 5 green.
+- **Acceptance criteria:** discover/invoke/register events emitted with actor/protocol/target/outcome; personal mode does not require the fail-closed durable sink; enterprise audit still available by config.
+- **Rollback condition:** select the compliance implementation by config.
+- **Evidence required:** event-log entries for a scripted discover/invoke/register run; enterprise audit tests green.
+
+### Phase 7 — Prune dormant enterprise code (optional, last, irreversible)
+- **Objective:** physically remove subsystems proven dormant, only where §25 shows deletion is cheaper than dormancy for upstream mergeability.
+- **Allowed change surface:** only items reconfirmed as safe-to-delete in §25 (deployment-only or weakly coupled), and only after a full personal-edition soak.
+- **Forbidden change surface:** the repository seam, protocol metadata, A2A/MCP surfaces, any seam contract, anything still reachable by a retained config.
+- **Entry criteria:** Phases 1–6 green; §25 divergence review signed off by owner.
+- **Acceptance criteria:** full suite green after deletion; no retained config references the removed code.
+- **Rollback condition:** hard — this is why it is last and optional.
+- **Evidence required:** full unit suite green; a grep proving no live reference to removed modules.
 
 ---
 
@@ -218,15 +259,17 @@ The correct order is derived from the dependency graph, not from "clean up deplo
 
 Design rule: *boring infrastructure, single owner, Docker Compose on one Mac/VPS, no Kubernetes, no workforce IAM, low operational overhead.* Reuse the existing core; do not rewrite.
 
-**Runtime processes (5 containers, all already present):**
+**Runtime processes (default topology per §21 = Option B; the auth-server is optional, not mandatory):**
 
-| Service | Source | Role in V1 |
-|---|---|---|
-| **registry** | `registry/` via `docker/Dockerfile.registry` | Control plane: registration, discovery, endpoint/protocol resolution, health, trust metadata, event log |
-| **mongodb-ce** | compose service | Single datastore (`STORAGE_BACKEND=mongodb-ce`) |
-| **auth-server (simplified)** | `auth_server/` reduced to one personal provider | Owner login + agent token validation |
-| **nginx (optional)** | `docker/` | TLS + optional front door; **off** in the p2p-default profile |
-| **frontend (trimmed)** | `frontend/` | Optional admin UI; IAM/audit/federation pages hidden |
+| Service | Source | Role in V1 | Default? |
+|---|---|---|---|
+| **registry** (with embedded personal auth via the §20.1 seam) | `registry/` via `docker/Dockerfile.registry` | Control plane: registration, discovery, endpoint/protocol resolution, health, trust metadata, event log, owner/agent identity | **Default** |
+| **mongodb-ce** | compose service | Single datastore (`STORAGE_BACKEND=mongodb-ce`) | **Default** |
+| **auth-server (simplified)** | `auth_server/` reduced to one personal provider | OAuth/OIDC login + token validation for owners who want it (Option A) | **Optional** |
+| **nginx** | `docker/` | TLS + optional front door; **off** in the p2p-default profile | **Optional** |
+| **frontend (trimmed)** | `frontend/` | Optional admin UI; IAM/audit/federation pages hidden | **Optional** |
+
+> §21 evaluates Options A/B/C and recommends **Option B** (embedded personal auth) as the default for lowest operational burden, with the auth-server retained as an optional process. This table reflects that recommendation; the final default-vs-optional call for the auth-server is owner decision §26.1.
 
 **Explicitly absent in V1:** Keycloak, metrics-service, Grafana/Prometheus, credentials-provider, Helm/Terraform/CDK, LLM scanners, telemetry.
 
@@ -285,6 +328,8 @@ The system must still answer: who is calling · which agent is being called · w
 
 **Non-goal:** do not rebuild OBO, group sync, DCR, or multi-IdP brokering. Those are the enterprise machinery being shed.
 
+> **Sequencing note (§20):** this target model is reached *behind the §20.1/§20.2 seams* — the enterprise resolver/RBAC engine is retained unchanged as the enterprise implementation, and the 3-tier model is added as the personal implementation. Nothing here is an in-place rewrite.
+
 ---
 
 ## 9. Lightweight Operational Event Model
@@ -306,6 +351,8 @@ Goal: replace compliance audit with a minimal log sufficient to answer *who disc
 4. Replace the audit UI pages with a single chronological event view (or omit the UI in V1 and query the collection).
 
 This is intentionally lightweight: no retention policy engine, no export workflow, no executive-summary statistics.
+
+> **Sequencing note (§20.3):** the lightweight model is added as the personal implementation of the audit event-sink seam. The fail-closed durable sink, HMAC, and compliance record taxonomy are *retained* as the enterprise implementation (selectable by config), so adopting the personal event log does not foreclose stronger audit semantics later.
 
 ---
 
@@ -353,13 +400,15 @@ Verified against `registry/api/server_routes.py`, `registry/services/server_serv
 
 ## 12. Top 5 Highest-Value Removals
 
-| # | Capability | Complexity removed | Operational burden removed | Code/dep impact | Migration risk | Delete or disable? |
+Ranked by value of removal/simplification. **Revised after divergence tracing (§25):** Preve is not trying to "clean the repository" — it is trying to create a maintainable personal edition that stays mergeable with upstream. Items whose deletion would raise upstream merge cost without reducing personal runtime burden are moved to **DEFER/dormant** rather than deleted. See §25 for the full re-evaluation.
+
+| # | Capability | Complexity removed | Operational burden removed | Code/dep impact | Migration risk | Verdict (revised) |
 |---|---|---|---|---|---|---|
-| 1 | **Enterprise IdP fleet + group→scope mapping** (6 providers, `group_filter.py`, `setup/idp/`, Keycloak/PingFederate dirs) | Very high | Very high (no IdP to run) | Large code + config | Medium (auth is load-bearing → do at the seam, Phase 4) | **Replace** with one personal provider; delete the rest |
-| 2 | **LLM security scanning** (`cisco-ai-*-scanner`, torch, langchain, strands) | High | Medium | Huge dependency impact (largest image-size win) | Low | **Delete** |
-| 3 | **AWS deployment machinery** (Terraform, CDK, Helm, CodeBuild, 7 workflows) | High | High | Large repo surface, zero runtime impact | Low (nothing imports it) | **Delete from fork** (Phase 1) |
-| 4 | **Compliance audit** (durable fail-closed sink, HMAC, audit UI) | Medium | Medium | Medium | Low-Medium | **Replace** with event log (§9) |
-| 5 | **Per-user egress credential brokerage** (`egress_auth/`, `credentials-provider/`, secret-store backends) | Medium-High | Medium | Medium | Low (default-off) | **Disable first, delete later** (defer) |
+| 1 | **Enterprise IdP fleet + group→scope mapping** (6 providers, `group_filter.py`, `setup/idp/`) | Very high | Very high (no IdP to run) | Large code + config | Medium (auth is load-bearing → seam first, Phase 4/5) | **Simplify behind seam**: one personal provider; keep `providers/base.py`; remove other providers only in Phase 7 if §25 confirms low merge cost |
+| 2 | **LLM security scanning** (`cisco-ai-*-scanner`, torch, langchain, strands) | High | Medium | Huge dependency impact (largest image-size win) | Low | **Remove dependencies** (Phase 2); these are heavy third-party deps, not upstream-mergeable code, so removal has no upstream-conflict cost |
+| 3 | **AWS deployment machinery** (Terraform, CDK, Helm, CodeBuild) | High (ops) | High | Large repo surface, **zero runtime impact** | Low (nothing imports it) | **DEFER — keep dormant in fork.** Deletion is deployment-only and safe, but it permanently diverges from upstream for no runtime benefit. Keep as unused dirs; revisit only if upstream churn makes merges painful |
+| 4 | **Compliance audit** (durable fail-closed sink, HMAC, audit UI) | Medium | Medium | Medium | Low-Medium | **Reduce behind seam** (Phase 6): add the operational-event implementation; keep the compliance implementation available by config |
+| 5 | **Per-user egress credential brokerage** (`egress_auth/`, `credentials-provider/`) | Medium-High | Medium | Medium | Low (default-off) | **DEFER — leave disabled.** Dormant, default-off, and deeply wired; deletion risk exceeds benefit |
 
 ---
 
@@ -418,8 +467,10 @@ mcp-gateway-registry/                 (fork, tracking upstream where possible)
 │   ├── repositories/                 #   KEEP — storage seam
 │   ├── schemas/                      #   KEEP — agent/mcp/skill/custom models
 │   ├── services/                     #   KEEP core; dormant services stay but flagged
-│   ├── auth/                         #   SIMPLIFY — 3-tier trust at dependencies.py seam
-│   ├── audit/                        #   SIMPLIFY — reduced to operational events (§9)
+│   ├── auth/                         #   SEAM (§20.1/§20.2) — add identity/trust seams;
+│   │                                 #     enterprise impl retained, personal impl added
+│   ├── audit/                        #   SEAM (§20.3) — add event-sink seam; compliance
+│   │                                 #     impl retained, lightweight sink added (§9)
 │   ├── health/                       #   KEEP
 │   └── core/config.py                #   personal-edition defaults
 ├── auth_server/                      # SIMPLIFY — one personal provider + /validate
@@ -435,44 +486,68 @@ mcp-gateway-registry/                 (fork, tracking upstream where possible)
 └── tests/                            # KEEP — trimmed to retained features
 ```
 
-**Removed from the personal fork:** `terraform/`, `infra/`, `charts/`, `buildspec.yml`, `setup/`, `keycloak/`, `pingfederate/`, `metrics-service/` (or kept optional), `credentials-provider/` (dormant), `landing/`, `agents/`+`servers/` samples (or keep one example), AWS-coupled workflows.
+**Dormant (kept in the fork but not in the personal runtime profile; per §25):** `terraform/`, `infra/`, `charts/`, `buildspec.yml`, `setup/`, `keycloak/`, `pingfederate/`, `metrics-service/`, `credentials-provider/`, `landing/`, `agents/`+`servers/` samples, AWS-coupled workflows. These are excluded from the personal Compose profile and CI-required checks but **retained in the tree** to preserve upstream mergeability; they are physically deleted only in the optional, irreversible Phase 7 if §25 later confirms deletion is cheaper than dormancy.
 
-**Why keep layout for retained code:** minimizing structural churn preserves the ability to cherry-pick upstream fixes (security patches to `registry/auth`, entity-model updates) with low merge friction — directly serving frozen principle 6.
+**Removed outright (firm removals per §25):** `core/telemetry.py` (phones home; low coupling) and the heavy ML scanner *dependencies* (`cisco-ai-*`, torch, langchain — third-party deps, not upstream-mergeable code). Everything else is dormancy, not deletion.
+
+**Why keep layout for retained code:** minimizing structural churn preserves the ability to cherry-pick upstream fixes (security patches to `registry/auth`, entity-model updates) with low merge friction — directly serving frozen principle 6 and the §19 survivability rule.
 
 ---
 
 ## 17. Exactly One Recommended First Implementation Slice
 
-**Slice: establish the "personal profile" configuration boundary** — a single, validated config preset that runs the existing system as a personal fabric (registry-only, p2p A2A, governance subsystems off, text-only search) with no code deletion.
+**Slice: introduce one validated Personal V1 deployment/configuration profile** that runs the existing system as a personal fabric using only existing capabilities, without deleting enterprise code and without simplifying auth yet.
 
-- **Objective:** prove the smallest coherent personal edition boots and serves registration/discovery/health on Compose + MongoDB-CE, using only configuration and one trivial UI/auth flag — establishing the boundary every later phase respects.
-- **Files/modules likely touched:**
-  - `registry/core/config.py` — add a `PREVE_PROFILE` (or profile preset) that composes existing flags: `DEPLOYMENT_MODE=registry-only`, `A2A_REVERSE_PROXY_ENABLED=false`, `RATE_LIMITING_ENABLED=false`, federation/telemetry off, search in text-only mode.
-  - A `docker-compose.preve.yml` (new) — registry + mongodb-ce + simplified auth-server only.
-  - `docs/preve/` — profile documentation.
-  - Optionally a frontend feature-flag to hide IAM/audit/federation nav.
-- **Dependencies first:** none — this is Phase 0/1 from §5 and is fully reversible.
-- **Acceptance criteria:** `docker compose -f docker-compose.preve.yml up` boots; an MCP server and an A2A agent register and are discoverable; health reflects them; no IdP required for agent-token flow; image/build has no scanner/telemetry calls.
-- **Required tests:** a config unit test asserting the preset composes flags correctly; a boot smoke test of the compose profile.
-- **Regression tests:** existing `tests/unit` suite green (the preset must not alter default behavior when unset).
-- **Operational validation:** p2p A2A confirmed — advertised agent `url` is the backend, not a gateway URL (assert `A2A_REVERSE_PROXY_ENABLED=false` path in `_apply_a2a_reverse_proxy_split`).
-- **Explicit non-goals:** no IdP removal, no RBAC simplification, no audit change, no code deletion, no dependency removal.
-- **Rollback strategy:** delete the profile/compose file; defaults untouched, so rollback is trivial.
+This is an **implementation contract** for the next PR. It is deliberately low-risk: it proves the personal topology is achievable through configuration alone and establishes the boundary every later phase respects.
 
-This slice is low-risk, independently testable, establishes the personal-edition architectural boundary (profile as the unit of "personal vs enterprise"), and materially advances the migration without any irreversible change.
+**What the slice must prove (acceptance criteria):**
+1. **Registry-only:** boots with `DEPLOYMENT_MODE=registry-only` (`config.py:132-136`); nginx is not required for the default path.
+2. **Peer-to-peer A2A default:** `A2A_REVERSE_PROXY_ENABLED=false` (`config.py:588`); a registered A2A agent's advertised `url` is its own backend, not a gateway URL (asserted via the `_apply_a2a_reverse_proxy_split` no-op path at `agent_routes.py:715`).
+3. **MongoDB CE:** runs against `STORAGE_BACKEND=mongodb-ce` (`config.py:73-110`); no DocumentDB.
+4. **Governance disabled unless explicitly enabled:** rate limiting, quarantine, federation, egress brokerage, and webhooks all default off; enabling any one requires an explicit flag.
+5. **No AWS dependency for local/personal runtime:** the profile boots and passes smoke tests with no AWS credentials, region, or service env set.
+6. **Search behavior explicitly defined:** the profile declares text-only vs. vector search; if vector search is off, search still returns correct keyword results (no silent breakage).
+7. **Documented Compose/profile startup:** `docker compose -f docker-compose.preve.yml up` (or equivalent documented profile) reaches healthy from a clean checkout.
+8. **MCP + A2A smoke tests pass:** register + discover one MCP server and one A2A agent end-to-end against the profile.
+
+**Files/modules likely touched (additive only):**
+- `registry/core/config.py` — add a composable profile preset (e.g., `PREVE_PROFILE`) that sets the flags above; must not change any default when unset.
+- `docker-compose.preve.yml` (new) — registry + mongodb-ce (+ simplified auth path) only.
+- `docs/preve/` — profile documentation and the runbook for the smoke tests.
+- Optionally a frontend feature-flag to hide IAM/audit/federation nav (presentation only; no page deletion).
+
+**Explicit non-goals (must NOT do):**
+- No auth rewrite.
+- No RBAC/scopes deletion.
+- No audit deletion.
+- No frontend redesign.
+- No repository/storage replacement.
+- No broad dependency cleanup (no torch/scanner removal in this slice).
+- No deletion of Terraform/Helm/AWS assets unless proven entirely isolated (deferred to §25 review).
+
+**Acceptance evidence required in the future PR:**
+- Boot log excerpt showing healthy startup from the documented Compose path.
+- Output of the MCP and A2A registration/discovery smoke tests.
+- An effective-settings dump (or config unit test) proving the governance flags resolve to off and search mode is explicit.
+- A network-egress check confirming no AWS endpoint is contacted.
+- The existing `tests/unit` suite green (proving the preset does not alter default behavior when unset).
+
+**Rollback strategy:** delete the profile/compose file; defaults untouched, so rollback is a trivial `git revert`.
+
+This slice is low-risk, independently testable, and establishes the personal-edition architectural boundary (profile as the unit of "personal vs enterprise") without any irreversible change.
 
 ---
 
 ## 18. Final Recommendation
 
-**Recommended V1 boundary.** Inside Preve Personal Edition V1: the FastAPI registry control plane (entity spine for MCP servers, A2A agents, skills, custom entities), the repository/storage abstraction on MongoDB-CE, a simplified single-provider auth-server implementing owner/trusted-agent/external, the health service, the discovery + well-known surface, the optional nginx front door (off by default, p2p A2A preserved), a trimmed frontend, and Docker Compose as the only deployment path. Outside V1: all enterprise IdPs, group RBAC, compliance audit (→ event log), egress brokerage, federation, rate-limit/quarantine governance, LLM scanning, telemetry, and all AWS/K8s deployment machinery.
+**Recommended V1 boundary (default = Option B, §21).** Inside Preve Personal Edition V1: the FastAPI registry control plane (entity spine for MCP servers, A2A agents, skills, custom entities) **with personal auth embedded via the §20.1 seam** (owner/trusted-agent/external), the repository/storage abstraction on MongoDB-CE, the health service, the discovery + well-known surface, and Docker Compose as the only deployment path. **Optional (not in the default topology):** the nginx front door (off by default, p2p A2A preserved), a simplified single-provider auth-server for OAuth/OIDC login, a trimmed frontend, and opt-in vector search. **Enterprise-only / dormant (outside the personal profile, not deleted):** all enterprise IdPs, group RBAC, compliance audit (→ event log behind the §20.3 seam), egress brokerage, federation, rate-limit/quarantine governance, LLM scanning, telemetry, and all AWS/K8s deployment machinery.
 
-**Top 5 removals.**
-1. Enterprise IdP fleet + group→scope mapping (→ one personal provider).
-2. LLM security scanning + torch/langchain dependency stack.
-3. AWS deployment machinery (Terraform, CDK, Helm, CodeBuild).
-4. Compliance audit (→ lightweight operational event log).
-5. Per-user egress credential brokerage (disable, then remove).
+**Top 5 removal/simplification targets (revised per §25 — most are simplify/defer, not delete).**
+1. Enterprise IdP fleet + group→scope mapping (→ one personal provider behind `providers/base.py`; seam first, delete other providers only if §25 confirms low merge cost).
+2. LLM security scanning + torch/langchain dependency stack (→ remove dependencies; no upstream-merge cost).
+3. AWS deployment machinery (Terraform, CDK, Helm, CodeBuild) (→ **keep dormant in fork**; deployment-only, zero runtime cost, deletion would diverge from upstream).
+4. Compliance audit (→ reduce to a lightweight operational-event implementation behind the audit seam; keep compliance mode available).
+5. Per-user egress credential brokerage (→ leave disabled/dormant).
 
 **Top 5 abstractions to preserve.**
 1. Repository/storage abstraction.
@@ -487,5 +562,213 @@ This slice is low-risk, independently testable, establishes the personal-edition
 1. **Datastore:** keep MongoDB-CE for V1 (recommended — zero code change) or invest in a lighter store behind the existing repository seam?
 2. **Personal identity provider:** single owner credential + agent tokens (simplest) vs. one self-hosted OIDC (e.g., a minimal provider) — how much does the owner value standards-based login?
 3. **Semantic search:** ship V1 text-only (light image) and add vector search as an opt-in extra, or is natural-language capability discovery core to the Preve experience from day one?
-4. **Peer federation:** is cross-registry (e.g., a second personal instance or a friend's fabric) a near-term need? If yes, keep the dormant peer-federation code; if no, it becomes a removal candidate in Phase 6.
+4. **Peer federation:** is cross-registry (e.g., a second personal instance or a friend's fabric) a near-term need? If yes, keep the dormant peer-federation code; if no, it becomes a removal candidate in Phase 7.
 5. **Gateway default:** should the personal fabric default to *no* gateway (pure p2p, registry-only) or ship the nginx front door enabled for reaching agents from other devices?
+
+> **Superseded by §26.** The open-questions list above is retained for narrative flow; the authoritative, deduplicated owner-decision list is §26 (Owner Decisions Required Before Implementation).
+
+---
+
+## 19. Upstream Survivability Strategy
+
+Preve is a long-lived fork of `agentic-community/mcp-gateway-registry`. The migration must not paint the fork into a corner where every upstream security patch or entity-model change requires a hand-merge. This section defines the preferred customization hierarchy, ordered from **lowest to highest long-term upstream-conflict risk**, and the rule the fork will follow.
+
+### 19.1 Customization hierarchy (low → high conflict risk)
+
+| # | Approach | Upstream conflict risk | Maintenance cost | Reversibility | Acceptable for Preve when… | Example in this repo |
+|---|---|---|---|---|---|---|
+| 1 | **Configuration / deployment profiles** | Lowest | Lowest | Trivially reversible (delete the profile) | The desired behavior already exists behind flags/env | `docker-compose.preve.yml` (new), `DEPLOYMENT_MODE=registry-only`, `RATE_LIMITING_ENABLED=false`, `A2A_REVERSE_PROXY_ENABLED=false`, `STORAGE_BACKEND=mongodb-ce` (`config.py`) |
+| 2 | **Feature flags** | Low | Low | Reversible (flip flag) | Behavior diverges but both paths are cheap to keep | `REGISTRY_MODE` (`config.py:139-146`), `enable_wellknown_discovery`, a new `PREVE_PROFILE` preset |
+| 3 | **Adapters / interfaces / provider implementations** | Low-Medium | Medium | Reversible (select a different impl) | Upstream already defines a seam, or one can be added without touching callers | `auth_server/providers/base.py` + per-IdP impls, `registry/repositories/interfaces.py` + `factory.py`, `registry/secrets/factory.py` |
+| 4 | **Isolated replacement modules** | Medium | Medium | Reversible (swap module) | A whole subsystem can be swapped behind an existing seam without editing its consumers | a personal trust-classification module behind the §20.2 trust seam; a slim event sink behind the §20.3 audit seam |
+| 5 | **Route / service rewrites** | High | High | Hard (callers change) | Only when no seam exists and the behavior is core to Preve's value | rewriting `agent_routes.py` discovery semantics — avoid for V1 |
+| 6 | **Deletion of upstream modules** | High (merge conflicts on every upstream touch of that module) | Low after deletion | Hard (must restore from upstream) | Only when the module is deployment-only or provably weakly coupled and upstream churn on it is low | `terraform/`, `infra/`, `charts/` (deployment-only) — but see §25: deletion still diverges |
+| 7 | **Invasive core-model rewrites** | Highest | Highest | Effectively irreversible | Never for V1; only if upstream abandons the model | changing the `AgentCard`/MCP `server.json` schema — forbidden by invariant §22 |
+
+### 19.2 The standing rule
+
+> **Prefer configuration boundary → stable abstraction seam → replacement implementation → deletion only when upstream coupling is proven negligible.**
+
+Concretely: try (1) a config/profile first; if that is insufficient, (2) add or use a feature flag; if the divergence is structural, (3) introduce or reuse an adapter/interface and supply a personal implementation; only (4) replace a module wholesale when a seam already isolates it; and (5) delete upstream code only after tracing shows it is deployment-only or weakly coupled (§25) and upstream churn on it is low. Core-model rewrites (7) are off the table for Personal V1.
+
+### 19.3 High-conflict upstream surfaces to avoid touching
+
+These files/dirs change frequently upstream or sit on shared paths; Preve should route around them via seams/flags rather than edit them:
+
+- `registry/main.py` — the lifespan/router registry; every upstream feature adds routers here. Add Preve routes via new modules, not edits.
+- `registry/core/config.py` — the central `Settings`; upstream adds settings constantly. Add Preve flags additively at the end; never reorder or rename upstream fields.
+- `registry/api/server_routes.py` (6,574 lines) and `registry/api/agent_routes.py` (2,894 lines) — the highest-churn route files. Prefer new route modules or feature-flagged branches over rewrites.
+- `registry/auth/dependencies.py` — 217 route injection points converge here. Touch only to *add* a seam, never to change the enterprise path's behavior.
+- `registry/repositories/interfaces.py` — the storage contract; upstream extends it per entity. Do not change existing method signatures.
+- `auth_server/server.py` (8,303 lines) — monolithic, high-churn; isolate rather than edit.
+- `docker/nginx_rev_proxy_http_and_https.conf` — templated; upstream adds location blocks. Do not hand-edit generated regions.
+
+### 19.4 Areas where deletion is relatively safe (deployment-only or weakly coupled)
+
+Deletion here has near-zero runtime blast radius and minimal upstream-merge cost *because nothing in the runtime imports them*:
+
+- `terraform/`, `infra/` (CDK), `charts/`, `buildspec.yml`, `setup/`, `landing/` — deployment/marketing only.
+- AWS-coupled GitHub workflows (ECR push, Terraform plan, CodeBuild triggers) — CI-only.
+- `agents/`, `servers/` sample content — demos, no runtime consumer.
+- `keycloak/`, `pingfederate/` provisioning scripts — deployment-time only.
+
+**However** — see §25 — "safe to delete" (no runtime coupling) is not the same as "cheap to delete" (upstream-merge cost). Deployment-only dirs are *safe* to delete but still *diverge* the fork; §25 recommends keeping them dormant unless upstream churn makes them a merge burden.
+
+---
+
+## 20. Freezing the Architectural Seams (no rewrites)
+
+The audit correctly identified auth, RBAC/scopes, and audit as deeply wired (217 `Depends(...)` injection points converge on `registry/auth/dependencies.py`). **The migration must not rewrite these systems in place.** Instead, it must first freeze stable abstraction seams, move the enterprise implementations behind them unchanged, and only then add personal implementations. This is Phase 4 (seams) before Phase 5 (personal implementation) in §5.
+
+### 20.1 Identity seam
+
+- **Conceptual interface:** principal resolution (who is calling), authentication (proof), session/token validation (is the credential valid now), machine identity (agent/service credential). No new class names are mandated — the existing `registry/auth/dependencies.py` already exposes the right functions (`resolve_session_from_cookie`, `get_current_user`, `nginx_proxied_auth`, `enhanced_auth`, `_context_from_internal_token`).
+- **Current implementation location:** `registry/auth/dependencies.py` (resolution + user-context derivation), `registry/auth/session_store.py` (motor-backed sessions), `registry/auth/internal.py` (HS256 machine tokens over shared `SECRET_KEY`), `registry/auth/proxied_token.py`, `registry/auth/session_crypto.py`.
+- **Consumers:** all 217 route `Depends(...)` injection points across `registry/api/*.py`; the nginx `/validate` subrequest contract (`X-User`/`X-Scopes`/`X-Groups`).
+- **Proposed stable contract:** a single `resolve_principal(request) -> Principal` seam where `Principal = { id, kind: owner|agent|external, credential_id, auth_method }`. Everything downstream consumes `Principal`, never IdP-specific claims.
+- **Enterprise implementation:** the current multi-IdP resolution (session cookie via auth-server, IdP JWT, internal token) behind the same `resolve_principal`.
+- **Personal implementation:** owner credential + agent bearer tokens (the existing self-signed JWT path), no IdP.
+- **Migration risk:** **High if edited in place; Low if added as a seam.** The contract must be additive: existing resolvers become the enterprise implementation with zero route changes.
+
+### 20.2 Authorization / trust seam
+
+Separate three concerns that the current engine fuses:
+
+- **Identity** — who the principal is (from §20.1).
+- **Trust classification** — a coarse label: `owner` / `trusted-agent` / `external`.
+- **Authorization decision** — whether principal X may perform action Y on entity Z.
+
+- **Current implementation location:** `registry/auth/access_resolver.py` (`UserAccess`, `resolve_scope_access`, `get_user_accessible_servers/tools`), fed by `ScopeRepositoryBase` (`registry/repositories/interfaces.py:526+`) and `SCOPES_CONFIG` group mappings; group enrichment in `auth_server/group_filter.py` / `mongodb_groups_enrichment.py`.
+- **Consumers:** route handlers via `get_accessible_servers_for_user`, `user_can_access_server`, `ui_permission_required`, etc. (`registry/auth/dependencies.py`).
+- **Proposed stable contract:** `classify_trust(principal) -> TrustTier` and `authorize(principal, action, resource) -> bool`. The trust classifier is pluggable; the authorizer consumes `(principal, trust_tier, resource)`.
+- **Enterprise implementation:** group→scope→ACL resolution (today's engine) as the `classify_trust`/`authorize` backing.
+- **Personal implementation:** `classify_trust` returns the 3 tiers from a static owner map + agent-token presence; `authorize` allows owner everything, trusted-agent invoke/discover, external read-only discovery. **The registry core never learns about enterprise IdPs** — it only sees `TrustTier`.
+- **How this differs from group→scope RBAC:** enterprise RBAC derives fine-grained per-tool ACLs from IdP group membership; the personal model derives a coarse tier from a local trust map. The seam keeps the *decision point* (`authorize`) identical so route handlers are untouched; only the *classification source* changes.
+- **Migration risk:** **Medium.** The resolver is centralized, but scope config and group mapping are broad; the seam must preserve the enterprise path byte-for-byte.
+
+### 20.3 Audit / operational-event seam
+
+Separate **security/compliance audit** (durable, fail-closed, non-repudiable) from **personal operational event history** (lightweight, best-effort).
+
+- **Current implementation location:** `registry/audit/service.py` (`AuditLogger`, `enforce_durable_audit_sink`, `NonDurableAuditError`), `registry/audit/middleware.py` (request/response capture), `registry/audit/models.py` (record taxonomy), `registry/repositories/audit_repository.py` (MongoDB sink).
+- **Consumers:** audit middleware on the app; auth-server via `registry.audit.mcp_logger.MCPLogger`; audit UI pages.
+- **Proposed stable contract:** an `EventSink` seam with `emit(event) -> None`, where `event = { ts, actor, action, target_entity, protocol, endpoint, outcome }` (§9). The fail-closed/durable/HMAC behavior is a *property of the compliance implementation*, not of the seam.
+- **Enterprise implementation:** today's durable MongoDB sink with `enforce_durable_audit_sink` and HMAC.
+- **Personal implementation:** a lightweight append to a `preve_events` collection (or stdout), **no fail-closed startup requirement** for ordinary operation.
+- **Preserving stronger semantics later:** the seam keeps the compliance implementation intact and selectable by config, so personal mode does not foreclose re-enabling durable audit.
+- **Migration risk:** **Low-Medium.** The sink is centralized in `AuditLogger`; the main risk is the middleware capture path, which must keep working for whichever sink is selected.
+
+---
+
+## 21. Personal V1 Topology — Challenging the Default
+
+The earlier recommendation (§6) assumed a separate auth-server. That assumption is challenged here. Three runtime shapes are evaluated on equal footing.
+
+- **Option A — Registry + MongoDB-CE + simplified auth-server + optional nginx.** Keeps the current two-service split, reduces auth-server to one personal provider.
+- **Option B — Registry + MongoDB-CE with personal auth embedded in the registry + optional nginx.** Collapses the identity broker into the registry process; no separate auth-server in the default topology.
+- **Option C — Registry + lighter persistence abstraction + personal auth + no gateway.** Swaps MongoDB for a lighter store and drops nginx from the default topology.
+
+### 21.1 Comparison
+
+| Criterion | Option A (separate auth-server) | Option B (embedded personal auth) | Option C (lighter store + no gateway) |
+|---|---|---|---|
+| **Upstream compatibility** | **Highest** — preserves the two-process split and the `/validate` contract; merges stay clean | Medium — registry gains an embedded resolver, but via the §20.1 seam so routes are untouched; auth-server becomes optional | Low-Medium — adds a new repository backend; the seam absorbs it, but a second backend is a maintenance surface |
+| **Complexity** | Medium (two services to run) | **Lower** (one app process) | Medium (new backend code) |
+| **Operational burden** | Medium (auth-server container + config) | **Lowest** (one process + MongoDB) | Low (no gateway) but new-store ops unknown |
+| **Security** | High — isolation between broker and registry; `/validate` is a separate trust boundary | Medium — auth logic shares the registry process; the shared-`SECRET_KEY` HS256 path (`registry/auth/internal.py:53-95`) already proves embedded validation is feasible, but the blast radius of a registry compromise grows | Medium — depends on the new store's auth/maturity |
+| **Migration effort** | **Lowest** — auth-server is reduced by config/provider selection, not moved | Medium — requires the §20.1 seam + an embedded personal resolver | **Highest** — new repository backend + auth + topology change at once |
+| **Future multi-agent scalability** | High — separate broker scales independently; M2M minting already centralized | Medium — fine for a personal fleet; embedding does not block many agents, just co-locates identity | Medium — depends on store |
+| **MCP + A2A support** | Clean — unchanged | Clean — unchanged (p2p A2A preserved; nginx optional) | Clean for A2A (no gateway = pure p2p); MCP gateway features lost if nginx dropped entirely |
+
+### 21.2 Recommendation
+
+**Default Personal V1 = Option B (registry + MongoDB-CE + embedded personal auth), with the auth-server retained as an optional process for owners who want the existing OAuth/OIDC login or a future return to multi-user.** Rationale:
+
+- Option B has the lowest operational burden (the owner's stated priority) and the repository already proves embedded token validation is feasible — registry and auth-server share `SECRET_KEY` for HS256 (`registry/auth/internal.py:53-95`), and `registry/auth/dependencies.py:814` already handles a signed-token path without a network hop to auth-server.
+- Crucially, Option B is reached **through the §20.1 seam**, not by rewriting routes: the 217 `Depends(...)` points keep calling `resolve_principal`; only the resolver's backing changes. This preserves upstream compatibility far better than editing route handlers.
+- Option A remains fully supported (the auth-server is not deleted) for owners who prefer the existing login UX. Option C is **deferred**: a lighter store is not worth a second repository backend in V1, and dropping nginx entirely is a topology choice the owner can make via `DEPLOYMENT_MODE=registry-only` without removing the gateway code.
+
+**Do not optimize for the fewest processes at the expense of maintainability** — Option B is chosen because it is *simpler to operate*, not merely smaller; it keeps the identity logic behind a seam so it remains testable and reversible.
+
+**Component classification for Personal V1:**
+
+- **Default:** registry (with embedded personal auth via the §20.1 seam), MongoDB-CE, the discovery + well-known + health surfaces, the operational-event sink (§20.3).
+- **Optional:** nginx front door (`with-gateway`), auth-server (for OAuth/OIDC login), frontend (trimmed), semantic search (opt-in extra).
+- **Deferred:** peer federation, egress credential brokerage, a lighter persistence backend (Option C).
+- **Enterprise-only (dormant, not in the personal profile):** workforce IdP fleet, group→scope RBAC, compliance audit sink, rate-limit/quarantine governance, registration webhooks, LLM security scanning, telemetry, Terraform/Helm/CDK.
+
+---
+
+## 22. Migration Invariants
+
+These properties must remain true **throughout** the migration, in every phase. A phase that would violate an invariant is not allowed to proceed. Each is grounded in current code.
+
+1. **MCP registration and discovery must remain functional.** The `server.json` registration model and discovery (`registry/api/server_routes.py`, `services/server_service.py`, `schemas/mcp_registry_schema.py`) keep working in every phase.
+2. **A2A agents must remain directly addressable peer-to-peer by default.** `A2A_REVERSE_PROXY_ENABLED` stays `false` by default (`config.py:588`); `_apply_a2a_reverse_proxy_split` (`agent_routes.py:715`) stays a no-op unless double-opted-in.
+3. **The registry must not silently become a mandatory data-plane proxy.** No change may rewrite advertised agent/server endpoints to a gateway URL without an explicit, visible opt-in; the `proxy_pass_url` split (`agent_routes.py:726-727`) must be preserved.
+4. **Protocol metadata must remain transport-neutral.** `supported_protocol` and endpoint advertisement (`schemas/agent_models.py`, `docs/supported-protocol-and-trust-fields.md`) must not be coupled to any single runtime's internals.
+5. **The repository abstraction must remain intact.** `registry/repositories/interfaces.py` method signatures and the `factory.py` seam are not broken; consumers keep using the abstraction, never a concrete store directly.
+6. **Personal mode must not require enterprise IdPs.** A personal deployment boots and serves discovery/invoke with no Keycloak/Entra/Okta/Auth0/Cognito/PingFederate.
+7. **Enterprise mode must not be broken merely to support personal mode.** With the enterprise implementation selected, the existing auth/RBAC/audit suites pass unchanged; personal additions are additive (flags/seams), not destructive edits.
+8. **Security-sensitive behavior must fail explicitly, never silently downgrade.** Examples to preserve: CORS fail-closed, scopes fail-closed on missing `tools` key, audit `enforce_durable_audit_sink` (`registry/audit/service.py:29`), SSRF guards (`registry/utils/url_guard.py`). Personal mode may *select* a lighter implementation, but must not silently weaken one.
+9. **Personal configuration must be reproducible and testable.** The personal profile is a versioned, documented artifact (§17) with a config unit test and a Compose smoke test.
+10. **No hidden dependency on AWS-specific infrastructure.** The personal runtime path must not require AWS credentials/services; AWS-specific code (AgentCore federation, Secrets Manager backend, DocumentDB SCRAM path) stays behind its existing opt-in flags/backends.
+
+---
+
+## 23. First Implementation Slice — Precise Contract
+
+*(Defined in §17.)* The first slice is the validated Personal V1 configuration/deployment profile. It is intentionally limited to the **lowest-risk tier of the §19 hierarchy (configuration/profile)**: it adds a Compose profile and a config preset, proves the personal topology through configuration alone, and touches no auth, RBAC, audit, repository, frontend-structure, or deployment-asset code. Its acceptance criteria and required evidence are enumerated in §17. It is the concrete realization of Phase 0–1 in §5.
+
+---
+
+## 24. Fork-Divergence Risk Table
+
+Classifies each major migration candidate by how much it diverges the fork from upstream (higher divergence = harder future merges). Distinct from runtime risk.
+
+| Candidate | Divergence risk | Why |
+|---|---|---|
+| **Docker Compose profiles** | **LOW** | Additive new file (`docker-compose.preve.yml`); upstream rarely touches a new file; zero edits to existing compose |
+| **AWS Terraform/CDK** | **LOW if kept dormant / HIGH if deleted** | Deployment-only; upstream edits it, so *deleting* it creates merge conflicts on every upstream infra change — keep dormant |
+| **Helm `charts/`** | **LOW if dormant / HIGH if deleted** | Same reasoning as Terraform; upstream actively maintains charts |
+| **IdP provider implementations** (`auth_server/providers/*.py`) | **MEDIUM** | Adding a personal provider is additive (LOW); *deleting* upstream providers diverges (HIGH). Prefer add + select |
+| **`auth_server/server.py`** | **HIGH** | Monolithic, high-churn, central to upstream auth; any edit conflicts. Isolate, don't edit |
+| **Scopes engine** (`auth/access_resolver.py`, scope repo) | **HIGH** | Core to upstream RBAC; editing diverges. Add the §20.2 trust seam instead of rewriting |
+| **Registry route files** (`server_routes.py`, `agent_routes.py`) | **HIGH** | Highest-churn files; rewrites guarantee conflicts. Add routes/flags, don't rewrite |
+| **Repository interfaces** (`repositories/interfaces.py`) | **HIGH if signatures change / LOW if only extended** | Upstream extends per entity; changing existing signatures breaks merges and all backends |
+| **A2A models/routes** (`schemas/agent_models.py`, `agent_routes.py`) | **MEDIUM** | Core to Preve but also upstream-active; change additively, preserve the p2p invariant |
+| **MCP models/routes** (`mcp_registry_schema.py`, `server_routes.py`) | **MEDIUM** | Tracks upstream MCP spec; additive extension only |
+| **Frontend IAM pages** (`IAM*.tsx`, `Audit*.tsx`, `Federation*.tsx`) | **LOW** | Hiding via a feature-flag/nav flag is additive; upstream UI churn is contained to these components |
+| **Audit subsystem** (`registry/audit/`) | **MEDIUM** | Add the §20.3 sink seam (additive) = LOW; rewriting record taxonomy = HIGH |
+| **Semantic search stack** (`semantic_search_service.py`, embeddings) | **MEDIUM** | Making it opt-in via extras/lazy-load is additive; removing the search route contract = HIGH |
+
+---
+
+## 25. Re-evaluation of REMOVE Recommendations
+
+Preve's goal is a **maintainable personal edition**, not a "clean repository." Every item previously marked REMOVE is re-judged on four questions: Is deletion necessary for Personal V1? Can it stay dormant? Does deletion raise upstream-merge cost? Does unused dependency weight affect runtime?
+
+| Item | Necessary for V1? | Can stay dormant? | Deletion raises merge cost? | Dep weight affects runtime? | **Revised verdict** |
+|---|---|---|---|---|---|
+| Terraform `aws-ecs/`, CDK `infra/` | No | Yes | **Yes** (upstream edits infra) | No (deployment-only, never imported) | **DEFER — keep dormant** |
+| Helm `charts/` | No | Yes | **Yes** (upstream maintains charts) | No | **DEFER — keep dormant** |
+| `buildspec.yml` | No | Yes | Low (single file, rarely edited) | No | **DEFER — keep dormant** (delete only if it rots) |
+| Extra IdP providers (5 of 6) | No (one suffices) | Yes (config-selected) | Yes (upstream may patch providers) | No (unused provider code is idle) | **DEFER — add personal provider, select it; delete others only in Phase 7 if merge cost proves low** |
+| Egress brokerage (`egress_auth/`, `credentials-provider/`) | No | Yes (default-off) | Medium | No (dormant) | **DEFER — leave disabled** |
+| Rate limiting / quarantine | No | Yes (default-off) | Medium | No | **DEFER — leave disabled** |
+| `agents/`, `servers/` samples | No | Yes | Low | No | **DEFER — keep as reference examples** |
+| LLM security scanner **deps** (`cisco-ai-*`, torch, langchain) | No | Partially (deps still install) | **No** (third-party deps, not upstream-mergeable code) | **Yes** (image size, install time) | **REMOVE dependencies (Phase 2)** — no upstream-merge cost, real runtime/image win |
+| Telemetry heartbeat (`core/telemetry.py`) | No | Could, but it phones home | Low (small, self-contained) | Minor (external call) | **REMOVE** — inappropriate for personal, low coupling |
+
+**Net change:** of the original REMOVE set, only `core/telemetry.py` and the heavy ML scanner *dependencies* remain firm removals — both are low-upstream-coupling and provide no personal value. Everything else moved to **DEFER/dormant**, because retaining dormant upstream code is cheaper than permanently diverging from a fork Preve wants to keep mergeable.
+
+---
+
+## 26. Owner Decisions Required Before Implementation
+
+Only decisions that cannot be inferred from repository evidence or the stated Project Preve goal. Everything else is derivable from the audit.
+
+1. **Default topology: Option B (embedded personal auth) vs. Option A (separate simplified auth-server)?** §21 recommends B for lowest operational burden while keeping A available, but the choice hinges on the owner's tolerance for co-locating identity logic with the registry versus running one extra container. Not decidable from code.
+2. **Personal identity mechanism: a single owner credential + agent bearer tokens, or a minimal self-hosted OIDC provider?** Both are implementable behind the §20.1 seam; the trade-off is standards-based login UX versus operational simplicity. A values call, not a technical one.
+3. **Semantic search in V1: ship text-only by default (lighter image, faster installs) and make vector search an opt-in extra — or is natural-language capability discovery core enough to Preve to pay the dependency cost from day one?** A product-priority decision; the code supports either.
+4. **Peer federation: near-term need or not?** If cross-registry federation (a second personal instance, a collaborator's fabric) is anticipated, keep the dormant peer-federation code; otherwise it becomes a Phase 7 removal candidate. Only the owner knows the roadmap.
