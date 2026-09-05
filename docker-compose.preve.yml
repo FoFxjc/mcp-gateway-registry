@@ -1,0 +1,298 @@
+# ---------------------------------------------------------------------------
+# Preve Personal Edition V1 -- Slice 1 deployment profile
+# ---------------------------------------------------------------------------
+# This is a standalone, self-contained Compose file for running the existing
+# MCP Gateway & Registry as a single-owner "personal" fabric, using only
+# capabilities that already exist upstream. It does NOT replace, extend, or
+# get merged with docker-compose.yml (the enterprise topology); run it on its
+# own with:
+#
+#   docker compose -f docker-compose.preve.yml up
+#
+# See docs/preve/personal-v1-runbook.md for prerequisites, exact startup /
+# shutdown commands, required environment variables, smoke tests, and known
+# limitations, and docs/preve/profile-behavior.md for the full list of
+# upstream defaults this profile overrides and why.
+#
+# Topology (3 containers + a one-shot init job; no separate gateway/Keycloak
+# container, no AWS, no metrics-service, no OpenBao):
+#   - mongodb       (MongoDB Community Edition -- the only datastore)
+#   - registry      (control plane; bundles nginx as in the upstream image,
+#                    but DEPLOYMENT_MODE=registry-only means no dynamic
+#                    nginx location blocks are generated for MCP servers --
+#                    see docs/preve/profile-behavior.md for what this does
+#                    and does not eliminate)
+#   - auth-server   (identity broker, reduced to the existing IdP-independent
+#                    static-token mechanism -- no Keycloak/Entra/Okta/Auth0/
+#                    Cognito/PingFederate provisioning of any kind)
+#
+# Explicitly absent from this profile: Keycloak, PingFederate, metrics-service,
+# Grafana/Prometheus, OpenBao/credentials-provider, any AWS service, Terraform/
+# CDK/Helm. See docs/preve/profile-behavior.md for the complete rationale.
+
+services:
+  # MongoDB keyfile initialization: generates the shared keyfile MongoDB
+  # requires for replica-set internal authentication when --auth is enabled.
+  # Identical in spirit to the same step in docker-compose.yml (issue-free to
+  # duplicate: it is a few lines of generic Alpine shell, not upstream code).
+  mongodb-keyfile-init:
+    image: alpine:3.21
+    container_name: preve-mongodb-keyfile-init
+    volumes:
+      - preve-mongodb-keyfile:/keyfile
+    command: >
+      sh -c "
+      if [ ! -f /keyfile/replica.key ]; then
+        echo 'Generating MongoDB keyfile...';
+        apk add --no-cache openssl;
+        openssl rand -base64 756 > /keyfile/replica.key;
+        chmod 400 /keyfile/replica.key;
+        chown 999:999 /keyfile/replica.key;
+        echo 'Keyfile generated successfully';
+      else
+        echo 'Keyfile already exists, skipping generation';
+      fi
+      "
+    restart: "no"
+
+  # MongoDB Community Edition -- the only datastore for the personal profile
+  # (STORAGE_BACKEND=mongodb-ce; no AWS DocumentDB). Root credentials are
+  # required with no default (fail closed rather than ship a guessable one).
+  mongodb:
+    image: mongo:8.2
+    container_name: preve-mongodb
+    command: mongod --replSet rs0 --bind_ip 127.0.0.1,mongodb --auth --keyFile /keyfile/replica.key
+    environment:
+      - MONGO_INITDB_ROOT_USERNAME=${DOCUMENTDB_USERNAME:?set DOCUMENTDB_USERNAME in .env}
+      - MONGO_INITDB_ROOT_PASSWORD=${DOCUMENTDB_PASSWORD:?set DOCUMENTDB_PASSWORD in .env}
+    ports:
+      # Loopback-only: host tools (mongosh) can reach it via localhost; never
+      # exposed on other interfaces by default.
+      - "${HOST_BIND_IP:-127.0.0.1}:27017:27017"
+    volumes:
+      - preve-mongodb-data:/data/db
+      - preve-mongodb-config:/data/configdb
+      - preve-mongodb-keyfile:/keyfile:ro
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - SETUID
+      - SETGID
+      - CHOWN
+      - DAC_OVERRIDE
+    depends_on:
+      mongodb-keyfile-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "mongosh", "-u", "${DOCUMENTDB_USERNAME}", "-p", "${DOCUMENTDB_PASSWORD}", "--authenticationDatabase", "admin", "--eval", "db.adminCommand('ping')"]
+      interval: 30s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    restart: unless-stopped
+
+  # One-shot initialization: replica set, indexes, and the default admin
+  # scope (mcp-registry-admin) that the personal profile's static registry
+  # token is granted. Reuses the same scripts as docker-compose.yml.
+  mongodb-init:
+    image: python:3.14-slim
+    container_name: preve-mongodb-init
+    depends_on:
+      mongodb:
+        condition: service_healthy
+    environment:
+      - DOCUMENTDB_HOST=mongodb
+      - DOCUMENTDB_PORT=27017
+      - DOCUMENTDB_DATABASE=${DOCUMENTDB_DATABASE:-mcp_registry}
+      - DOCUMENTDB_USERNAME=${DOCUMENTDB_USERNAME:?set DOCUMENTDB_USERNAME in .env}
+      - DOCUMENTDB_PASSWORD=${DOCUMENTDB_PASSWORD:?set DOCUMENTDB_PASSWORD in .env}
+      - DOCUMENTDB_NAMESPACE=${DOCUMENTDB_NAMESPACE:-default}
+    volumes:
+      - ./scripts/init-mongodb-ce.py:/app/scripts/init-mongodb-ce.py:ro
+      - ./scripts/registry-admins.json:/app/scripts/registry-admins.json:ro
+      - ./scripts/mcp-registry-admin.json:/app/scripts/mcp-registry-admin.json:ro
+      - ./scripts/mcp-servers-unrestricted-read.json:/app/scripts/mcp-servers-unrestricted-read.json:ro
+      - ./scripts/mcp-servers-unrestricted-execute.json:/app/scripts/mcp-servers-unrestricted-execute.json:ro
+      - ./scripts/federation-service.json:/app/scripts/federation-service.json:ro
+    command: >
+      sh -c "
+      pip install --quiet motor pymongo &&
+      python /app/scripts/init-mongodb-ce.py
+      "
+    restart: "no"
+
+  # Identity broker, reduced to the existing IdP-independent static-token
+  # mechanism (docs/registry-api-auth.md). No enterprise IdP is configured or
+  # provisioned. See docs/preve/profile-behavior.md for why the auth-server
+  # is included by default in Slice 1 rather than deferred (topology choice
+  # is explicitly open per the architecture audit, §21/§27).
+  auth-server:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.auth
+      args:
+        BUILD_VERSION: ${BUILD_VERSION:-1.0.0}
+    container_name: preve-auth-server
+    environment:
+      - REGISTRY_URL=${REGISTRY_URL:-http://localhost:8080}
+      - REGISTRY_NAME=${REGISTRY_NAME:-Preve Personal Registry}
+      - REGISTRY_ORGANIZATION_NAME=${REGISTRY_ORGANIZATION_NAME:-Personal}
+      - AUTH_SERVER_EXTERNAL_URL=${AUTH_SERVER_EXTERNAL_URL:-http://localhost:8888}
+      - SECRET_KEY=${SECRET_KEY:?set SECRET_KEY in .env (32+ bytes; see docs/preve/personal-v1-runbook.md)}
+      - AUTH_SERVER_NGINX_MARKER_SECRET=${AUTH_SERVER_NGINX_MARKER_SECRET:?set AUTH_SERVER_NGINX_MARKER_SECRET in .env (32+ bytes)}
+      # Per-user egress credential vault stays off (audit §6/§21: deferred).
+      - EGRESS_AUTH_ENABLED=false
+      # No enterprise IdP is configured or provisioned in the personal profile.
+      - AUTH_PROVIDER=${AUTH_PROVIDER:-cognito}
+      - KEYCLOAK_ENABLED=false
+      - COGNITO_ENABLED=false
+      - ENTRA_ENABLED=false
+      - AUTH0_ENABLED=false
+      - PINGFEDERATE_ENABLED=false
+      - GITHUB_ENABLED=false
+      - GOOGLE_ENABLED=false
+      - STORAGE_BACKEND=${STORAGE_BACKEND:-mongodb-ce}
+      - DOCUMENTDB_HOST=mongodb
+      - DOCUMENTDB_PORT=27017
+      - DOCUMENTDB_USERNAME=${DOCUMENTDB_USERNAME}
+      - DOCUMENTDB_PASSWORD=${DOCUMENTDB_PASSWORD}
+      - DOCUMENTDB_DATABASE=${DOCUMENTDB_DATABASE:-mcp_registry}
+      - DOCUMENTDB_NAMESPACE=${DOCUMENTDB_NAMESPACE:-default}
+      - DOCUMENTDB_USE_TLS=false
+      # Governance disabled by default (audit §6/§7).
+      - RATE_LIMITING_ENABLED=false
+      - FEDERATION_STATIC_TOKEN_AUTH_ENABLED=false
+      # Registry API static token auth: the personal profile's IdP-independent
+      # access mechanism (docs/registry-api-auth.md). Grants the caller the
+      # mcp-registry-admin scope seeded by mongodb-init -- appropriate for a
+      # single owner. Protect REGISTRY_API_TOKEN like a password.
+      - REGISTRY_STATIC_TOKEN_AUTH_ENABLED=${REGISTRY_STATIC_TOKEN_AUTH_ENABLED:-true}
+      - REGISTRY_API_TOKEN=${REGISTRY_API_TOKEN:?set REGISTRY_API_TOKEN in .env (32+ bytes; see docs/preve/personal-v1-runbook.md)}
+      - APP_LOG_LEVEL=${APP_LOG_LEVEL:-INFO}
+      - APP_LOG_CENTRALIZED_ENABLED=false
+      - APP_LOG_DIR=/var/log/containers/ai-registry
+    ports:
+      # Loopback-only direct port for host health checks; normal traffic
+      # reaches auth-server through the registry container's nginx front door.
+      - "${HOST_BIND_IP:-127.0.0.1}:8888:8888"
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    volumes:
+      - preve-auth-logs:/app/logs
+    depends_on:
+      mongodb-init:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  # Control plane: MCP/A2A/skill registration, discovery, and health. Bundles
+  # nginx (as the upstream image always does) as the static front door for
+  # the Registry API (/api/*, docs/registry-api-auth.md); DEPLOYMENT_MODE=
+  # registry-only means nginx does NOT get dynamic per-server/per-agent
+  # location blocks, so it never becomes a mandatory data-plane hop for MCP
+  # tool calls or A2A traffic (docs/preve/profile-behavior.md).
+  registry:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.registry
+      args:
+        BUILD_VERSION: ${BUILD_VERSION:-1.0.0}
+    container_name: preve-registry
+    environment:
+      # Enables the Slice 1 personal-edition config preset in
+      # registry/core/config.py. Purely additive: see
+      # PREVE_PERSONAL_PROFILE_DEFAULTS there and docs/preve/profile-behavior.md
+      # for the exact list of defaults this activates. Every value below is
+      # also set explicitly so this file stays correct even if the preset
+      # changes upstream.
+      - PREVE_PROFILE=personal
+      - DEPLOYMENT_MODE=registry-only
+      - REGISTRY_MODE=${REGISTRY_MODE:-full}
+      - REGISTRY_URL=${REGISTRY_URL:-http://localhost:8080}
+      - REGISTRY_NAME=${REGISTRY_NAME:-Preve Personal Registry}
+      - REGISTRY_ORGANIZATION_NAME=${REGISTRY_ORGANIZATION_NAME:-Personal}
+      - SECRET_KEY=${SECRET_KEY:?set SECRET_KEY in .env (32+ bytes; see docs/preve/personal-v1-runbook.md)}
+      - AUTH_SERVER_NGINX_MARKER_SECRET=${AUTH_SERVER_NGINX_MARKER_SECRET:?set AUTH_SERVER_NGINX_MARKER_SECRET in .env (32+ bytes)}
+      - AUTH_SERVER_URL=http://auth-server:8888
+      - AUTH_SERVER_EXTERNAL_URL=${AUTH_SERVER_EXTERNAL_URL:-http://localhost:8888}
+      # A2A stays peer-to-peer by default (migration invariant, audit §10/§22.2).
+      - A2A_REVERSE_PROXY_ENABLED=false
+      # No enterprise IdP configured or provisioned.
+      - AUTH_PROVIDER=${AUTH_PROVIDER:-cognito}
+      - KEYCLOAK_ENABLED=false
+      - COGNITO_ENABLED=false
+      - ENTRA_ENABLED=false
+      - AUTH0_ENABLED=false
+      - PINGFEDERATE_ENABLED=false
+      - GITHUB_ENABLED=false
+      - GOOGLE_ENABLED=false
+      - STORAGE_BACKEND=${STORAGE_BACKEND:-mongodb-ce}
+      - DOCUMENTDB_HOST=mongodb
+      - DOCUMENTDB_PORT=27017
+      - DOCUMENTDB_USERNAME=${DOCUMENTDB_USERNAME}
+      - DOCUMENTDB_PASSWORD=${DOCUMENTDB_PASSWORD}
+      - DOCUMENTDB_DATABASE=${DOCUMENTDB_DATABASE:-mcp_registry}
+      - DOCUMENTDB_NAMESPACE=${DOCUMENTDB_NAMESPACE:-default}
+      - DOCUMENTDB_USE_TLS=false
+      # Governance disabled by default (audit §6/§7); enable explicitly if needed.
+      - RATE_LIMITING_ENABLED=false
+      - REGISTRATION_GATE_ENABLED=false
+      - EGRESS_AUTH_ENABLED=false
+      - FEDERATION_STATIC_TOKEN_AUTH_ENABLED=false
+      - AWS_REGISTRY_FEDERATION_ENABLED=false
+      # No AWS credentials file is mounted (see the /dev/null volume below).
+      - AWS_SHARED_CREDENTIALS_FILE=/dev/null
+      # Semantic search keeps its existing default behavior in Slice 1 (see
+      # docs/preve/profile-behavior.md "Semantic search" for why this is a
+      # documented limitation, not a code change, in this slice).
+      - EMBEDDINGS_PROVIDER=${EMBEDDINGS_PROVIDER:-sentence-transformers}
+      - EMBEDDINGS_MODEL_NAME=${EMBEDDINGS_MODEL_NAME:-all-MiniLM-L6-v2}
+      # Telemetry disabled (phones home to an external endpoint; audit §25).
+      - TELEMETRY_ENABLED=false
+      - MCP_TELEMETRY_DISABLED=1
+      # Registry API static token auth mirrored here for the System Config
+      # UI; the auth-server is the actual enforcement point.
+      - REGISTRY_STATIC_TOKEN_AUTH_ENABLED=${REGISTRY_STATIC_TOKEN_AUTH_ENABLED:-true}
+      - REGISTRY_API_TOKEN=${REGISTRY_API_TOKEN:?set REGISTRY_API_TOKEN in .env (32+ bytes; see docs/preve/personal-v1-runbook.md)}
+      - APP_LOG_LEVEL=${APP_LOG_LEVEL:-INFO}
+      - APP_LOG_CENTRALIZED_ENABLED=false
+      - APP_LOG_DIR=/var/log/containers/ai-registry
+    ports:
+      # Primary personal control-plane port: nginx HTTP front door for the
+      # Registry API. No separate gateway container is required -- this is
+      # the same image/process the registry always ships, just without
+      # dynamic per-server MCP location blocks (registry-only mode).
+      - "${PREVE_HTTP_PORT:-8080}:8080"
+      # Direct FastAPI/uvicorn port (bypasses nginx entirely). This is what
+      # the image's own HEALTHCHECK targets; useful for host-side health
+      # checks. It does NOT accept the static bearer token (nginx_proxied_auth
+      # only trusts a token minted by the auth-server's /validate hop over
+      # the nginx path) -- see docs/preve/personal-v1-runbook.md "Known
+      # limitations".
+      - "${PREVE_DIRECT_PORT:-7860}:7860"
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    volumes:
+      - preve-registry-logs:/app/logs
+      - preve-registry-scans:/app/security_scans
+      # No AWS credentials are ever mounted in the personal profile.
+      - /dev/null:/dev/null:ro
+    depends_on:
+      auth-server:
+        condition: service_started
+      mongodb-init:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+volumes:
+  preve-mongodb-data:
+  preve-mongodb-config:
+  preve-mongodb-keyfile:
+  preve-registry-logs:
+  preve-registry-scans:
+  preve-auth-logs:

@@ -1,4 +1,5 @@
 import logging
+import os
 import re
 from datetime import UTC
 from enum import Enum
@@ -2461,6 +2462,78 @@ def log_tab_visibility_warnings(s: Settings) -> None:
                 param_name,
                 mode.value,
             )
+
+
+# --- Preve Personal Edition profile (Slice 1) --------------------------------
+# Optional, purely additive deployment/config preset (see
+# docs/preve/profile-behavior.md and docs/preve/personal-edition-migration-audit.md
+# §17/§27 for the frozen contract this implements). When PREVE_PROFILE is unset
+# (or anything other than "personal"), _apply_preve_personal_profile() is a
+# no-op and every setting below resolves to its normal upstream default --
+# this preset introduces no new configuration system, only a documented,
+# reversible bundle of existing environment-variable defaults.
+#
+# Every value is applied with os.environ.setdefault(), so a variable the
+# operator has already set explicitly (via the shell, .env, or Compose) is
+# NEVER overridden by this preset -- it only fills in defaults that would
+# otherwise fall through to the upstream (enterprise-oriented) default.
+PREVE_PERSONAL_PROFILE_DEFAULTS: dict[str, str] = {
+    # Control-plane only: DEPLOYMENT_MODE=registry-only disables dynamic nginx
+    # location-block generation for MCP servers, so the personal control plane
+    # does not depend on the gateway being fronted separately (config.py
+    # nginx_updates_enabled).
+    "DEPLOYMENT_MODE": "registry-only",
+    # Peer-to-peer A2A is a migration invariant (see audit §10/§22.2): restated
+    # explicitly here even though it already matches the upstream default, so
+    # the personal profile is self-documenting and defensive against a future
+    # upstream default change.
+    "A2A_REVERSE_PROXY_ENABLED": "false",
+    # Community MongoDB, no AWS DocumentDB. Already the upstream default;
+    # restated for explicitness.
+    "STORAGE_BACKEND": "mongodb-ce",
+    # Governance/enterprise machinery left off. Most of these already match
+    # the upstream default (verified in docs/preve/profile-behavior.md); they
+    # are restated here so a personal deployment never silently inherits an
+    # enabled governance feature from an upstream default change, and so the
+    # effective configuration is easy to audit (Settings().model_dump()).
+    "RATE_LIMITING_ENABLED": "false",
+    "RATE_LIMIT_QUARANTINE_FAIL_CLOSED": "false",
+    "REGISTRATION_GATE_ENABLED": "false",
+    "EGRESS_AUTH_ENABLED": "false",
+    "FEDERATION_STATIC_TOKEN_AUTH_ENABLED": "false",
+    # Not a pydantic Settings field (read directly from os.environ in
+    # registry/main.py:_apply_aws_registry_env_vars); included here so the
+    # profile explicitly disables AWS-registry federation rather than
+    # relying on whatever is already stored in the federation config.
+    "AWS_REGISTRY_FEDERATION_ENABLED": "false",
+    # Telemetry phones home to an external endpoint, which is inappropriate
+    # for a personal deployment (audit §25). Disabling it via the existing
+    # flag is in-scope for Slice 1; physically removing core/telemetry.py is
+    # deferred to a later phase (audit §27 note 3) and is NOT done here.
+    "TELEMETRY_ENABLED": "false",
+    "MCP_TELEMETRY_DISABLED": "1",
+}
+
+
+def _apply_preve_personal_profile() -> None:
+    """Seed environment defaults for PREVE_PROFILE=personal (Slice 1 only).
+
+    No-op unless PREVE_PROFILE is exactly "personal" (case-insensitive,
+    surrounding whitespace ignored). Must run before ``Settings()`` is
+    instantiated below. See PREVE_PERSONAL_PROFILE_DEFAULTS for the exact
+    values and rationale.
+    """
+    if os.environ.get("PREVE_PROFILE", "").strip().lower() != "personal":
+        return
+    logger.info(
+        "PREVE_PROFILE=personal: applying Slice 1 personal-edition defaults "
+        "(operator-supplied environment variables are never overridden)."
+    )
+    for key, value in PREVE_PERSONAL_PROFILE_DEFAULTS.items():
+        os.environ.setdefault(key, value)
+
+
+_apply_preve_personal_profile()
 
 
 # Global settings instance
